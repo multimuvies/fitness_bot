@@ -1,4 +1,6 @@
-"""handlers/analytics.py — выбор интервала, чекпоинты, краткая и детальная статистика"""
+"""handlers/analytics.py — интервал, чекпоинты, краткая и детальная статистика
+    + список приёмов пищи (Дата-время — еда, ккал) в развёрнутой статистике
+"""
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -9,7 +11,6 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from sqlalchemy import func
 from sqlmodel import select
 
-from config import settings
 from models_and_db import (
     get_session,
     User,
@@ -21,13 +22,12 @@ from models_and_db import (
 from handlers.menu import menu_button
 
 router = Router()
-ITEMS_PER_PAGE = 5               # чекпоинтов на страницу
-MSK = ZoneInfo("Europe/Moscow")  # московский часовой пояс
+ITEMS_PER_PAGE = 5
+MSK = ZoneInfo("Europe/Moscow")
 
 
-# ─────────────────────── вспомогательные ───────────────────────
+# ────────────────────────── утилиты ──────────────────────────
 def _scalar(raw: Any) -> int:
-    """Приведение агрегатного результата к int (учёт разных версий SQLModel)."""
     if raw is None:
         return 0
     if isinstance(raw, tuple):
@@ -46,24 +46,18 @@ def fmt(n: int | float) -> str:
 
 
 def interval_from_choice(user_id: int, choice: str) -> tuple[datetime, datetime]:
-    """
-    Возвращает (start, end) в naive-UTC.
-    choice: '1d', '7d', 'cp_<id>'
-    """
-    now_utc = datetime.utcnow()  # naive UTC
-
+    now_utc = datetime.utcnow()
     if choice == "1d":
         start = now_utc.replace(hour=0, minute=1, second=0, microsecond=0)
     elif choice == "7d":
         start = (now_utc - timedelta(days=7)).replace(
             hour=0, minute=1, second=0, microsecond=0
         )
-    else:  # checkpoint
+    else:
         cp_id = int(choice.split("_")[1])
         with get_session() as s:
             cp = s.get(Checkpoint, cp_id)
         start = cp.created_at.astimezone(timezone.utc).replace(tzinfo=None)
-
     return start, now_utc
 
 
@@ -162,6 +156,12 @@ def calc_stats(user: User, start: datetime, end: datetime) -> dict:
         ).all()
         popular = [f"{r[0]} ({r[1]})" for r in rows]
 
+        meal_rows = s.exec(
+            select(Meal)
+            .where((Meal.user_id == user.id) & (Meal.created_at.between(start, end)))
+            .order_by(Meal.created_at)
+        ).all()
+
         start_w = s.exec(
             select(Weight)
             .where((Weight.user_id == user.id) & (Weight.created_at <= start))
@@ -191,6 +191,7 @@ def calc_stats(user: User, start: datetime, end: datetime) -> dict:
         "balance": balance,
         "workouts_cnt": workouts_cnt,
         "popular": popular,
+        "meal_rows": meal_rows,  # список объектов Meal
     }
 
 
@@ -225,8 +226,13 @@ async def show_stats(call: types.CallbackQuery, choice: str):
     start, end = interval_from_choice(call.from_user.id, choice)
     st = calc_stats(user, start, end)
 
+    interval_str = (
+        f"{start.astimezone(MSK):%d.%m.%Y %H:%M}"
+        f"  —  {moscow_now():%d.%m.%Y %H:%M}"
+    )
+
     text = (
-        f"<b>Статистика</b>\n{start.astimezone(MSK):%d.%m.%Y} — {moscow_now():%d.%m.%Y}\n\n"
+        f"<b>Статистика</b>\n{interval_str}\n\n"
         f"Баланс ккал: <b>{fmt(st['balance'])}</b>\n"
         f"Изменение веса: <b>{st['delta_w']} кг</b>\n"
         f"Тренировок: <b>{st['workouts_cnt']}</b>\n\n"
@@ -250,7 +256,25 @@ async def details(call: types.CallbackQuery):
     start, end = interval_from_choice(call.from_user.id, choice)
     st = calc_stats(user, start, end)
 
+    interval_str = (
+        f"{start.astimezone(MSK):%d.%m.%Y %H:%M}"
+        f"  —  {moscow_now():%d.%m.%Y %H:%M}"
+    )
+
+    # формируем список приёмов пищи
+    meal_lines = [
+        f"{m.created_at.astimezone(MSK):%d.%m %H:%M} — {m.description} "
+        f"({m.calories} ккал)"
+        for m in st["meal_rows"]
+    ]
+    # чтобы не превысить лимит 4096 символов, ограничим вывод
+    joined_meals = "\n".join(meal_lines)
+    max_len = 3000  # оставим запас под остальной текст
+    if len(joined_meals) > max_len:
+        joined_meals = joined_meals[:max_len] + "\n…"
+
     text = (
+        f"<b>Ваша статистика за интервал:</b>\n{interval_str}\n\n"
         f"<b>I. Вес</b>\n"
         f"Было: {st['start_w']} кг → Стало: {st['end_w']} кг\n"
         f"Δ: <b>{st['delta_w']} кг</b>\n\n"
@@ -261,7 +285,8 @@ async def details(call: types.CallbackQuery):
         f"Баланс: <b>{fmt(st['balance'])} ккал</b>\n\n"
         f"<b>III. Тренировки</b>\n"
         f"Всего: {st['workouts_cnt']}\n"
-        f"Популярные: {', '.join(st['popular']) or 'нет'}"
-        "\n\n\n <b>ИИ-ассистент для спорта и питания: @AI_sportik_bot</b>\n"
+        f"Популярные: {', '.join(st['popular']) or 'нет'}\n\n"
+        f"<b>IV. Приёмы пищи</b>\n{joined_meals}"
+        "\n\n\n <b>ИИ-ассистент для спорта и питания: @AI_sportик_bot</b>\n"
     )
     await call.message.edit_text(text, reply_markup=menu_button())
